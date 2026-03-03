@@ -1260,14 +1260,6 @@ mark.search-highlight {
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hidden { display: none !important; }
 
-/* Agent card actions */
-.agent-card-actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 0.5rem;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-}
 
 /* Agent picker in chat empty state */
 .agent-pick-card {
