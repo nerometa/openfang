@@ -361,6 +361,7 @@ pub async fn run_agent_loop(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -729,6 +730,7 @@ pub async fn run_agent_loop(
                              wanted to do and that it requires their approval.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -746,6 +748,7 @@ pub async fn run_agent_loop(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -916,7 +919,11 @@ async fn call_with_retry(
             Err(e) => {
                 // Use classifier for smarter error handling
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1026,7 +1033,11 @@ async fn stream_with_retry(
             }
             Err(e) => {
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1282,9 +1293,15 @@ pub async fn run_agent_loop_streaming(
             thinking: None,
         };
 
-        // Notify phase: Streaming (streaming variant always streams)
+        // Notify phase: on first iteration emit Streaming; on subsequent
+        // iterations (after tool execution) emit Thinking so the UI shows
+        // "Thinking..." instead of overwriting streamed text with "streaming".
         if let Some(cb) = on_phase {
-            cb(LoopPhase::Streaming);
+            if iteration == 0 {
+                cb(LoopPhase::Streaming);
+            } else {
+                cb(LoopPhase::Thinking);
+            }
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
@@ -1321,6 +1338,7 @@ pub async fn run_agent_loop_streaming(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -1697,6 +1715,7 @@ pub async fn run_agent_loop_streaming(
                              wanted to do and that it requires their approval.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1714,6 +1733,7 @@ pub async fn run_agent_loop_streaming(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1811,6 +1831,7 @@ pub async fn run_agent_loop_streaming(
 /// 6. `[TOOL_CALL]...[/TOOL_CALL]` blocks (JSON or arrow syntax) — issue #354
 /// 7. `<tool_call>{"name":"tool","arguments":{...}}</tool_call>` — Qwen3, issue #332
 /// 8. Bare JSON `{"name":"tool","arguments":{...}}` objects (last resort, only if no tags found)
+/// 9. `<function name="tool" parameters="{...}" />` — XML attribute style (Groq/Llama)
 ///
 /// Validates tool names against available tools and returns synthetic `ToolCall` entries.
 fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
@@ -2143,6 +2164,53 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
                     input,
                 });
             }
+        }
+    }
+
+    // Pattern 9: <function name="tool" parameters="{...}" /> — XML attribute style
+    // Groq/Llama sometimes emit self-closing XML with name/parameters attributes.
+    // The parameters value is HTML-entity-escaped JSON (&quot; etc.).
+    {
+        use regex_lite::Regex;
+        // Match both self-closing <function ... /> and <function ...></function>
+        let re = Regex::new(
+            r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#
+        ).unwrap();
+        for caps in re.captures_iter(text) {
+            let tool_name = caps.get(1).unwrap().as_str();
+            let raw_params = caps.get(2).unwrap().as_str();
+
+            if !tool_names.contains(&tool_name) {
+                warn!(tool = tool_name, "XML-attribute tool call for unknown tool — skipping");
+                continue;
+            }
+
+            // Unescape HTML entities (&quot; &amp; &lt; &gt; &apos;)
+            let unescaped = raw_params
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&apos;", "'");
+
+            let input: serde_json::Value = match serde_json::from_str(&unescaped) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tool = tool_name, error = %e, "Failed to parse XML-attribute tool call params — skipping");
+                    continue;
+                }
+            };
+
+            if calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                continue;
+            }
+
+            info!(tool = tool_name, "Recovered XML-attribute tool call → synthetic ToolUse");
+            calls.push(ToolCall {
+                id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                name: tool_name.to_string(),
+                input,
+            });
         }
     }
 
@@ -2513,6 +2581,7 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::ToolUse,
                     tool_calls: vec![ToolCall {
@@ -2574,6 +2643,7 @@ mod tests {
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Hello from the agent!".to_string(),
+                    provider_metadata: None,
                 }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
@@ -2826,6 +2896,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Recovered after retry!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
@@ -3568,6 +3639,47 @@ mod tests {
         assert_eq!(calls[0].input["command"], "ls");
     }
 
+    // --- Pattern 9: XML-attribute style <function name="..." parameters="..." /> ---
+
+    #[test]
+    fn test_recover_xml_attribute_basic() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function name="web_search" parameters="{&quot;query&quot;: &quot;best crypto 2024&quot;}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "best crypto 2024");
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function name="unknown_tool" parameters="{&quot;x&quot;: 1}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_non_selfclosing() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function name="shell_exec" parameters="{&quot;command&quot;: &quot;ls&quot;}"></function>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+    }
+
     // --- Helper function tests ---
 
     #[test]
@@ -3654,6 +3766,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: r#"Let me search for that. <function=web_search>{"query":"rust async"}</function>"#.to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![], // BUG: no tool_calls!
@@ -3667,6 +3780,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Based on the search results, Rust async is great!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],

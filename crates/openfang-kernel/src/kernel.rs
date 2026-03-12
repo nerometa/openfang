@@ -151,6 +151,10 @@ pub struct OpenFangKernel {
     pub channel_adapters: dashmap::DashMap<String, Arc<dyn openfang_channels::types::ChannelAdapter>>,
     /// Hot-reloadable default model override (set via config hot-reload, read at agent spawn).
     pub default_model_override: std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
+    /// Per-agent message locks — serializes LLM calls for the same agent to prevent
+    /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
+    /// messages via Telegram). Different agents can still run in parallel.
+    agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -565,6 +569,7 @@ impl OpenFangKernel {
                 .base_url
                 .clone()
                 .or_else(|| config.provider_urls.get(&config.default_model.provider).cloned()),
+            skip_permissions: true,
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
@@ -585,6 +590,7 @@ impl OpenFangKernel {
                         provider: provider.to_string(),
                         api_key: std::env::var(env_var).ok(),
                         base_url: config.provider_urls.get(provider).cloned(),
+                        skip_permissions: true,
                     };
                     match drivers::create_driver(&auto_config) {
                         Ok(d) => {
@@ -629,6 +635,7 @@ impl OpenFangKernel {
                     .base_url
                     .clone()
                     .or_else(|| config.provider_urls.get(&fb.provider).cloned()),
+                skip_permissions: true,
             };
             match drivers::create_driver(&fb_config) {
                 Ok(d) => {
@@ -802,12 +809,20 @@ impl OpenFangKernel {
             use openfang_runtime::embedding::create_embedding_driver;
             let configured_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
-                // Explicit config takes priority — use the configured embedding model
+                // Explicit config takes priority — use the configured embedding model.
+                // If the user left embedding_model at the default ("all-MiniLM-L6-v2"),
+                // pick a sensible default for the chosen provider so we don't send a
+                // local model name to a cloud API.
+                let model = if configured_model == "all-MiniLM-L6-v2" {
+                    default_embedding_model_for_provider(provider)
+                } else {
+                    configured_model.as_str()
+                };
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
                 let custom_url = config.provider_urls.get(provider.as_str()).map(|s| s.as_str());
-                match create_embedding_driver(provider, configured_model, api_key_env, custom_url) {
+                match create_embedding_driver(provider, model, api_key_env, custom_url) {
                     Ok(d) => {
-                        info!(provider = %provider, model = %configured_model, "Embedding driver configured from memory config");
+                        info!(provider = %provider, model = %model, "Embedding driver configured from memory config");
                         Some(Arc::from(d))
                     }
                     Err(e) => {
@@ -817,14 +832,14 @@ impl OpenFangKernel {
                 }
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
                 let model = if configured_model == "all-MiniLM-L6-v2" {
-                    "text-embedding-3-small"
+                    default_embedding_model_for_provider("openai")
                 } else {
                     configured_model.as_str()
                 };
                 let openai_url = config.provider_urls.get("openai").map(|s| s.as_str());
                 match create_embedding_driver("openai", model, "OPENAI_API_KEY", openai_url) {
                     Ok(d) => {
-                        info!("Embedding driver auto-detected: OpenAI");
+                        info!(model = %model, "Embedding driver auto-detected: OpenAI");
                         Some(Arc::from(d))
                     }
                     Err(e) => {
@@ -835,14 +850,14 @@ impl OpenFangKernel {
             } else {
                 // Try Ollama (local, no key needed)
                 let model = if configured_model == "all-MiniLM-L6-v2" {
-                    "nomic-embed-text"
+                    default_embedding_model_for_provider("ollama")
                 } else {
                     configured_model.as_str()
                 };
                 let ollama_url = config.provider_urls.get("ollama").map(|s| s.as_str());
                 match create_embedding_driver("ollama", model, "", ollama_url) {
                     Ok(d) => {
-                        info!("Embedding driver auto-detected: Ollama (local)");
+                        info!(model = %model, "Embedding driver auto-detected: Ollama (local)");
                         Some(Arc::from(d))
                     }
                     Err(e) => {
@@ -984,6 +999,7 @@ impl OpenFangKernel {
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
+            agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -1400,6 +1416,10 @@ impl OpenFangKernel {
     /// When `content_blocks` is `Some`, the LLM agent loop receives structured
     /// multimodal content (text + images) instead of just a text string. This
     /// enables vision models to process images sent from channels like Telegram.
+    ///
+    /// Per-agent locking ensures that concurrent messages for the same agent
+    /// are serialized (preventing session corruption), while messages for
+    /// different agents run in parallel.
     pub async fn send_message_with_handle_and_blocks(
         &self,
         agent_id: AgentId,
@@ -1407,6 +1427,17 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
     ) -> KernelResult<AgentLoopResult> {
+        // Acquire per-agent lock to serialize concurrent messages for the same agent.
+        // This prevents session corruption when multiple messages arrive in quick
+        // succession (e.g. rapid voice messages via Telegram). Messages for different
+        // agents are not blocked — each agent has its own independent lock.
+        let lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         // Enforce quota before running the agent loop
         self.scheduler
             .check_quota(agent_id)
@@ -2596,20 +2627,51 @@ impl OpenFangKernel {
     }
 
     /// Switch an agent's model.
-    pub fn set_agent_model(&self, agent_id: AgentId, model: &str) -> KernelResult<()> {
-        // Resolve provider from model catalog so switching models also switches provider
-        let resolved_provider = self
-            .model_catalog
-            .read()
-            .ok()
-            .and_then(|catalog| {
-                catalog
-                    .find_model(model)
-                    .map(|entry| entry.provider.clone())
-            });
+    ///
+    /// When `explicit_provider` is `Some`, that provider name is used as-is
+    /// (respecting the user's custom configuration). When `None`, the provider
+    /// is auto-detected from the model catalog or inferred from the model name,
+    /// but only if the agent does NOT have a custom `base_url` configured.
+    /// Agents with a custom `base_url` keep their current provider unless
+    /// overridden explicitly — this prevents custom setups (e.g. Tencent,
+    /// Azure, or other third-party endpoints) from being misidentified.
+    pub fn set_agent_model(
+        &self,
+        agent_id: AgentId,
+        model: &str,
+        explicit_provider: Option<&str>,
+    ) -> KernelResult<()> {
+        let provider = if let Some(ep) = explicit_provider {
+            // User explicitly set the provider — use it as-is
+            Some(ep.to_string())
+        } else {
+            // Check whether the agent has a custom base_url, which indicates
+            // a user-configured provider endpoint. In that case, preserve the
+            // current provider name instead of overriding it with auto-detection.
+            let has_custom_url = self
+                .registry
+                .get(agent_id)
+                .map(|e| e.manifest.model.base_url.is_some())
+                .unwrap_or(false);
 
-        // If catalog lookup failed, try to infer provider from model name prefix
-        let provider = resolved_provider.or_else(|| infer_provider_from_model(model));
+            if has_custom_url {
+                // Keep the current provider — don't let auto-detection override
+                // a deliberately configured custom endpoint.
+                None
+            } else {
+                // No custom base_url: safe to auto-detect from catalog / model name
+                let resolved_provider = self
+                    .model_catalog
+                    .read()
+                    .ok()
+                    .and_then(|catalog| {
+                        catalog
+                            .find_model(model)
+                            .map(|entry| entry.provider.clone())
+                    });
+                resolved_provider.or_else(|| infer_provider_from_model(model))
+            }
+        };
 
         // Strip the provider prefix from the model name (e.g. "openrouter/deepseek/deepseek-chat" → "deepseek/deepseek-chat")
         let normalized_model = if let Some(ref prov) = provider {
@@ -2874,7 +2936,6 @@ impl OpenFangKernel {
         agent_id: AgentId,
     ) -> KernelResult<openfang_runtime::compactor::ContextReport> {
         use openfang_runtime::compactor::generate_context_report;
-        use openfang_runtime::tool_runner::builtin_tool_definitions;
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -2893,7 +2954,8 @@ impl OpenFangKernel {
             });
 
         let system_prompt = &entry.manifest.model.system_prompt;
-        let tools = builtin_tool_definitions();
+        // Use the agent's actual filtered tools instead of all builtins
+        let tools = self.available_tools(agent_id);
         // Use 200K default or the model's known context window
         let context_window = if session.context_window_tokens > 0 {
             session.context_window_tokens
@@ -2920,6 +2982,14 @@ impl OpenFangKernel {
         self.capabilities.revoke_all(agent_id);
         self.event_bus.unsubscribe_agent(agent_id);
         self.triggers.remove_agent_triggers(agent_id);
+
+        // Remove cron jobs so they don't linger as orphans (#504)
+        let cron_removed = self.cron_scheduler.remove_agent_jobs(agent_id);
+        if cron_removed > 0 {
+            if let Err(e) = self.cron_scheduler.persist() {
+                warn!("Failed to persist cron jobs after agent deletion: {e}");
+            }
+        }
 
         // Remove from persistent storage
         let _ = self.memory.remove_agent(agent_id);
@@ -3027,6 +3097,18 @@ impl OpenFangKernel {
             } else {
                 None
             },
+            // Redundant safety: tool_allowlist mirrors capabilities.tools above.
+            // available_tools() already filters by capabilities.tools, but this
+            // provides defense-in-depth.
+            tool_allowlist: def.tools.clone(),
+            tool_blocklist: Vec::new(),
+            // Custom profile avoids ToolProfile-based expansion overriding the
+            // explicit tool list.
+            profile: if !def.tools.is_empty() {
+                Some(ToolProfile::Custom)
+            } else {
+                None
+            },
             ..Default::default()
         };
 
@@ -3066,9 +3148,14 @@ impl OpenFangKernel {
             );
         }
 
-        // If an agent with this hand's name already exists, remove it first
+        // If an agent with this hand's name already exists, remove it first.
+        // Save triggers before kill so they can be restored under the new ID
+        // (issue #519 — triggers were lost on agent restart).
         let existing = self.registry.list().into_iter().find(|e| e.name == def.agent.name);
         let old_agent_id = existing.as_ref().map(|e| e.id);
+        let saved_triggers = old_agent_id
+            .map(|id| self.triggers.take_agent_triggers(id))
+            .unwrap_or_default();
         if let Some(old) = existing {
             info!(agent = %old.name, id = %old.id, "Removing existing hand agent for reactivation");
             let _ = self.kill_agent(old.id);
@@ -3076,6 +3163,19 @@ impl OpenFangKernel {
 
         // Spawn the agent
         let agent_id = self.spawn_agent(manifest)?;
+
+        // Restore triggers from the old agent under the new agent ID (#519).
+        if !saved_triggers.is_empty() {
+            let restored = self.triggers.restore_triggers(agent_id, saved_triggers);
+            if restored > 0 {
+                info!(
+                    old_agent = %old_agent_id.unwrap(),
+                    new_agent = %agent_id,
+                    restored,
+                    "Reassigned triggers after hand reactivation"
+                );
+            }
+        }
 
         // Migrate cron jobs from old agent to new agent so they survive restarts.
         // Without this, persisted cron jobs would reference the stale old UUID
@@ -3433,11 +3533,12 @@ impl OpenFangKernel {
                 match self.activate_hand(&hand_id, config) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
-                        // Reassign cron jobs from the pre-restart agent ID to the
-                        // newly spawned agent so scheduled tasks survive daemon
-                        // restarts (issue #402). activate_hand only handles
-                        // reassignment when an existing agent is found in the live
-                        // registry, which is empty on a fresh boot.
+                        // Reassign cron jobs and triggers from the pre-restart
+                        // agent ID to the newly spawned agent so scheduled tasks
+                        // and event triggers survive daemon restarts (issues
+                        // #402, #519). activate_hand only handles reassignment
+                        // when an existing agent is found in the live registry,
+                        // which is empty on a fresh boot.
                         if let (Some(old_id), Some(new_id)) = (old_agent_id, inst.agent_id) {
                             if old_id != new_id {
                                 let migrated =
@@ -3453,6 +3554,20 @@ impl OpenFangKernel {
                                     if let Err(e) = self.cron_scheduler.persist() {
                                         warn!("Failed to persist cron jobs after hand restore: {e}");
                                     }
+                                }
+                                // Reassign triggers (#519). Currently a no-op on
+                                // cold boot (triggers are in-memory only), but
+                                // correct if trigger persistence is added later.
+                                let t_migrated =
+                                    self.triggers.reassign_agent_triggers(old_id, new_id);
+                                if t_migrated > 0 {
+                                    info!(
+                                        hand = %hand_id,
+                                        old_agent = %old_id,
+                                        new_agent = %new_id,
+                                        migrated = t_migrated,
+                                        "Reassigned triggers after restart"
+                                    );
                                 }
                             }
                         }
@@ -4005,6 +4120,28 @@ impl OpenFangKernel {
     /// without requiring a daemon restart. Uses the hot-reloaded default model
     /// override when available.
     /// If fallback models are configured, wraps the primary in a `FallbackDriver`.
+    /// Look up a provider's base URL, checking runtime catalog first, then boot-time config.
+    ///
+    /// Custom providers added at runtime via the dashboard (`set_provider_url`) are
+    /// stored in the model catalog but NOT in `self.config.provider_urls` (which is
+    /// the boot-time snapshot). This helper checks both sources so that custom
+    /// providers work immediately without a daemon restart.
+    fn lookup_provider_url(&self, provider: &str) -> Option<String> {
+        // 1. Boot-time config (from config.toml [provider_urls])
+        if let Some(url) = self.config.provider_urls.get(provider) {
+            return Some(url.clone());
+        }
+        // 2. Model catalog (updated at runtime by set_provider_url / apply_url_overrides)
+        if let Ok(catalog) = self.model_catalog.read() {
+            if let Some(p) = catalog.get_provider(provider) {
+                if !p.base_url.is_empty() {
+                    return Some(p.base_url.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn resolve_driver(&self, manifest: &AgentManifest) -> KernelResult<Arc<dyn LlmDriver>> {
         let agent_provider = &manifest.model.provider;
 
@@ -4053,23 +4190,27 @@ impl OpenFangKernel {
                 std::env::var(&env_var).ok()
             };
 
-            // Don't inherit default provider's base_url when switching providers
+            // Don't inherit default provider's base_url when switching providers.
+            // Uses lookup_provider_url() which checks both boot-time config AND the
+            // runtime model catalog, so custom providers added via the dashboard
+            // (which only update the catalog, not self.config) are found (#494).
             let base_url = if has_custom_url {
                 manifest.model.base_url.clone()
             } else if agent_provider == default_provider {
                 effective_default
                     .base_url
                     .clone()
-                    .or_else(|| self.config.provider_urls.get(agent_provider.as_str()).cloned())
+                    .or_else(|| self.lookup_provider_url(agent_provider))
             } else {
-                // Check provider_urls before falling back to hardcoded defaults
-                self.config.provider_urls.get(agent_provider.as_str()).cloned()
+                // Check provider_urls + catalog before falling back to hardcoded defaults
+                self.lookup_provider_url(agent_provider)
             };
 
             let driver_config = DriverConfig {
                 provider: agent_provider.clone(),
                 api_key,
                 base_url,
+                skip_permissions: true,
             };
 
             match drivers::create_driver(&driver_config) {
@@ -4114,7 +4255,8 @@ impl OpenFangKernel {
                     base_url: fb
                         .base_url
                         .clone()
-                        .or_else(|| self.config.provider_urls.get(&fb.provider).cloned()),
+                        .or_else(|| self.lookup_provider_url(&fb.provider)),
+                    skip_permissions: true,
                 };
                 match drivers::create_driver(&config) {
                     Ok(d) => chain.push((d, fb.model.clone())),
@@ -4445,11 +4587,18 @@ impl OpenFangKernel {
         }
     }
 
-    /// Get the list of tools available to an agent based on its capabilities.
+    /// Get the list of tools available to an agent based on its manifest.
+    ///
+    /// The agent's declared tools (`capabilities.tools`) are the primary filter.
+    /// Only tools listed there are sent to the LLM, saving tokens and preventing
+    /// the model from calling tools the agent isn't designed to use.
+    ///
+    /// If `capabilities.tools` is empty (or contains `"*"`), all tools are
+    /// available (backwards compatible).
     fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
         let all_builtins = builtin_tool_definitions();
 
-        // Look up agent entry for profile, skill/MCP allowlists, and capabilities
+        // Look up agent entry for profile, skill/MCP allowlists, and declared tools
         let entry = self.registry.get(agent_id);
         let (skill_allowlist, mcp_allowlist, tool_profile) = entry
             .as_ref()
@@ -4462,31 +4611,51 @@ impl OpenFangKernel {
             })
             .unwrap_or_default();
 
-        // Filter builtin tools by ToolProfile (if set and not Full).
-        // This is the primary token-saving mechanism: a chat agent with ToolProfile::Minimal
-        // gets 2 tools instead of 46+, saving ~15-20K tokens of tool definitions.
+        // Extract the agent's declared tool list from capabilities.tools.
+        // This is the primary mechanism: only send declared tools to the LLM.
+        let declared_tools: Vec<String> = entry
+            .as_ref()
+            .map(|e| e.manifest.capabilities.tools.clone())
+            .unwrap_or_default();
+
+        // Check if the agent has unrestricted tool access:
+        // - capabilities.tools is empty (not specified → all tools)
+        // - capabilities.tools contains "*" (explicit wildcard)
+        let tools_unrestricted = declared_tools.is_empty()
+            || declared_tools.iter().any(|t| t == "*");
+
+        // Step 1: Filter builtin tools.
+        // Priority: declared tools > ToolProfile > all builtins.
         let has_tool_all = entry.as_ref().is_some_and(|_| {
             let caps = self.capabilities.list(agent_id);
             caps.iter().any(|c| matches!(c, Capability::ToolAll))
         });
 
-        let mut all_tools = match &tool_profile {
-            Some(profile) if *profile != ToolProfile::Full && *profile != ToolProfile::Custom => {
-                let allowed = profile.tools();
-                all_builtins
-                    .into_iter()
-                    .filter(|t| allowed.iter().any(|a| a == "*" || a == &t.name))
-                    .collect()
+        let mut all_tools: Vec<ToolDefinition> = if !tools_unrestricted {
+            // Agent declares specific tools — only include matching builtins
+            all_builtins
+                .into_iter()
+                .filter(|t| declared_tools.iter().any(|d| d == &t.name))
+                .collect()
+        } else {
+            // No specific tools declared — fall back to profile or all builtins
+            match &tool_profile {
+                Some(profile)
+                    if *profile != ToolProfile::Full && *profile != ToolProfile::Custom =>
+                {
+                    let allowed = profile.tools();
+                    all_builtins
+                        .into_iter()
+                        .filter(|t| allowed.iter().any(|a| a == "*" || a == &t.name))
+                        .collect()
+                }
+                _ if has_tool_all => all_builtins,
+                _ => all_builtins,
             }
-            _ if has_tool_all => all_builtins,
-            _ => all_builtins,
         };
 
-        // Track tool names added by skills/MCP — these already passed their own
-        // allowlist filters and should bypass the per-agent capability check.
-        let mut extension_tool_names = std::collections::HashSet::new();
-
-        // Add skill-provided tools (filtered by agent's skill allowlist)
+        // Step 2: Add skill-provided tools (filtered by agent's skill allowlist,
+        // then by declared tools).
         let skill_tools = {
             let registry = self
                 .skill_registry
@@ -4499,7 +4668,12 @@ impl OpenFangKernel {
             }
         };
         for skill_tool in skill_tools {
-            extension_tool_names.insert(skill_tool.name.clone());
+            // If agent declares specific tools, only include matching skill tools
+            if !tools_unrestricted
+                && !declared_tools.iter().any(|d| d == &skill_tool.name)
+            {
+                continue;
+            }
             all_tools.push(ToolDefinition {
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
@@ -4507,20 +4681,17 @@ impl OpenFangKernel {
             });
         }
 
-        // Add MCP tools (filtered by agent's MCP server allowlist)
+        // Step 3: Add MCP tools (filtered by agent's MCP server allowlist,
+        // then by declared tools).
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
-            if mcp_allowlist.is_empty() {
-                for t in mcp_tools.iter() {
-                    extension_tool_names.insert(t.name.clone());
-                }
-                all_tools.extend(mcp_tools.iter().cloned());
+            let mcp_candidates: Vec<ToolDefinition> = if mcp_allowlist.is_empty() {
+                mcp_tools.iter().cloned().collect()
             } else {
-                // Normalize allowlist names for matching
                 let normalized: Vec<String> = mcp_allowlist
                     .iter()
                     .map(|s| openfang_runtime::mcp::normalize_name(s))
                     .collect();
-                let filtered: Vec<_> = mcp_tools
+                mcp_tools
                     .iter()
                     .filter(|t| {
                         openfang_runtime::mcp::extract_mcp_server(&t.name)
@@ -4528,15 +4699,19 @@ impl OpenFangKernel {
                             .unwrap_or(false)
                     })
                     .cloned()
-                    .collect();
-                for t in &filtered {
-                    extension_tool_names.insert(t.name.clone());
+                    .collect()
+            };
+            for t in mcp_candidates {
+                // If agent declares specific tools, only include matching MCP tools
+                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
+                    continue;
                 }
-                all_tools.extend(filtered);
+                all_tools.push(t);
             }
         }
 
-        // Apply per-agent tool allowlist/blocklist (manifest-level filtering)
+        // Step 4: Apply per-agent tool_allowlist/tool_blocklist overrides.
+        // These are separate from capabilities.tools and act as additional filters.
         let (tool_allowlist, tool_blocklist) = entry
             .as_ref()
             .map(|e| (e.manifest.tool_allowlist.clone(), e.manifest.tool_blocklist.clone()))
@@ -4549,8 +4724,7 @@ impl OpenFangKernel {
             all_tools.retain(|t| !tool_blocklist.iter().any(|b| b == &t.name));
         }
 
-        // Remove shell_exec from tool list if exec_policy won't allow it,
-        // so the LLM doesn't try to call a tool that will be blocked.
+        // Step 5: Remove shell_exec if exec_policy denies it.
         let exec_blocks_shell = entry.as_ref().is_some_and(|e| {
             e.manifest
                 .exec_policy
@@ -4561,26 +4735,7 @@ impl OpenFangKernel {
             all_tools.retain(|t| t.name != "shell_exec");
         }
 
-        let caps = self.capabilities.list(agent_id);
-
-        // If agent has ToolAll, return all tools
-        if caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
-            return all_tools;
-        }
-
-        // Filter to tools the agent has capability for.
-        // MCP and skill tools bypass this check — they already passed their
-        // own allowlist filters above (mcp_servers / skills on the manifest).
         all_tools
-            .into_iter()
-            .filter(|tool| {
-                extension_tool_names.contains(&tool.name)
-                    || caps.iter().any(|c| match c {
-                        Capability::ToolInvoke(name) => name == &tool.name || name == "*",
-                        _ => false,
-                    })
-            })
-            .collect()
     }
 
     /// Collect prompt context from prompt-only skills for system prompt injection.
@@ -4857,6 +5012,27 @@ fn apply_budget_defaults(
     }
     if budget.max_monthly_usd > 0.0 && resources.max_cost_per_month_usd == 0.0 {
         resources.max_cost_per_month_usd = budget.max_monthly_usd;
+    }
+    // Override per-agent hourly token limit when the global default is set.
+    // This lets users raise (or lower) the token budget for all agents at once
+    // via config.toml [budget] default_max_llm_tokens_per_hour = 10000000
+    if budget.default_max_llm_tokens_per_hour > 0 {
+        resources.max_llm_tokens_per_hour = budget.default_max_llm_tokens_per_hour;
+    }
+}
+
+/// Pick a sensible default embedding model for a given provider when the user
+/// configured an explicit `embedding_provider` but left `embedding_model` at the
+/// default value (which is a local model name that cloud APIs wouldn't recognise).
+fn default_embedding_model_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "text-embedding-3-small",
+        "mistral" => "mistral-embed",
+        "cohere" => "embed-english-v3.0",
+        // Local providers use nomic-embed-text as a good default
+        "ollama" | "vllm" | "lmstudio" => "nomic-embed-text",
+        // Other OpenAI-compatible APIs typically support the OpenAI model names
+        _ => "text-embedding-3-small",
     }
 }
 
@@ -5453,6 +5629,7 @@ impl KernelHandle for OpenFangKernel {
         channel: &str,
         recipient: &str,
         message: &str,
+        thread_id: Option<&str>,
     ) -> Result<String, String> {
         let adapter = self
             .channel_adapters
@@ -5476,10 +5653,19 @@ impl KernelHandle for OpenFangKernel {
             openfang_user: None,
         };
 
-        adapter
-            .send(&user, openfang_channels::types::ChannelContent::Text(message.to_string()))
-            .await
-            .map_err(|e| format!("Channel send failed: {e}"))?;
+        let content = openfang_channels::types::ChannelContent::Text(message.to_string());
+
+        if let Some(tid) = thread_id {
+            adapter
+                .send_in_thread(&user, content, tid)
+                .await
+                .map_err(|e| format!("Channel send failed: {e}"))?;
+        } else {
+            adapter
+                .send(&user, content)
+                .await
+                .map_err(|e| format!("Channel send failed: {e}"))?;
+        }
 
         Ok(format!("Message sent to {} via {}", recipient, channel))
     }
@@ -5492,6 +5678,7 @@ impl KernelHandle for OpenFangKernel {
         media_url: &str,
         caption: Option<&str>,
         filename: Option<&str>,
+        thread_id: Option<&str>,
     ) -> Result<String, String> {
         let adapter = self
             .channel_adapters
@@ -5529,12 +5716,71 @@ impl KernelHandle for OpenFangKernel {
             }
         };
 
-        adapter
-            .send(&user, content)
-            .await
-            .map_err(|e| format!("Channel media send failed: {e}"))?;
+        if let Some(tid) = thread_id {
+            adapter
+                .send_in_thread(&user, content, tid)
+                .await
+                .map_err(|e| format!("Channel media send failed: {e}"))?;
+        } else {
+            adapter
+                .send(&user, content)
+                .await
+                .map_err(|e| format!("Channel media send failed: {e}"))?;
+        }
 
         Ok(format!("{} sent to {} via {}", media_type, recipient, channel))
+    }
+
+    async fn send_channel_file_data(
+        &self,
+        channel: &str,
+        recipient: &str,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, String> {
+        let adapter = self
+            .channel_adapters
+            .get(channel)
+            .ok_or_else(|| {
+                let available: Vec<String> = self
+                    .channel_adapters
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                format!(
+                    "Channel '{}' not found. Available channels: {:?}",
+                    channel, available
+                )
+            })?
+            .clone();
+
+        let user = openfang_channels::types::ChannelUser {
+            platform_id: recipient.to_string(),
+            display_name: recipient.to_string(),
+            openfang_user: None,
+        };
+
+        let content = openfang_channels::types::ChannelContent::FileData {
+            data,
+            filename: filename.to_string(),
+            mime_type: mime_type.to_string(),
+        };
+
+        if let Some(tid) = thread_id {
+            adapter
+                .send_in_thread(&user, content, tid)
+                .await
+                .map_err(|e| format!("Channel file send failed: {e}"))?;
+        } else {
+            adapter
+                .send(&user, content)
+                .await
+                .map_err(|e| format!("Channel file send failed: {e}"))?;
+        }
+
+        Ok(format!("File '{}' sent to {} via {}", filename, recipient, channel))
     }
 
     async fn spawn_agent_checked(
